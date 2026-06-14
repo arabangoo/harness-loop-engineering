@@ -1,0 +1,627 @@
+"""MCP command group for Ouroboros.
+
+Start and manage the MCP (Model Context Protocol) server.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from enum import Enum
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+from typing import Annotated
+
+from rich.console import Console
+import typer
+
+from ouroboros.cli.commands.mcp_doctor import register_doctor_command
+from ouroboros.cli.formatters.panels import print_info, print_success
+
+# PID file for detecting stale instances
+_PID_DIR = Path.home() / ".ouroboros"
+_PID_FILE = _PID_DIR / "mcp-server.pid"
+
+# Separate stderr console for stdio transport (stdout is JSON-RPC channel)
+_stderr_console = Console(stderr=True)
+
+
+class AgentRuntimeBackend(str, Enum):  # noqa: UP042
+    """Supported orchestrator runtime backends for MCP commands."""
+
+    CLAUDE = "claude"
+    CODEX = "codex"
+    OPENCODE = "opencode"
+    HERMES = "hermes"
+    GEMINI = "gemini"
+    KIRO = "kiro"
+    COPILOT = "copilot"
+    GOOSE = "goose"
+    PI = "pi"
+
+
+class LLMBackend(str, Enum):  # noqa: UP042
+    """Supported LLM-only backends for MCP commands."""
+
+    CLAUDE_CODE = "claude_code"
+    LITELLM = "litellm"
+    CODEX = "codex"
+    GOOSE = "goose"
+    COPILOT = "copilot"
+    OPENCODE = "opencode"
+    GEMINI = "gemini"
+    KIRO = "kiro"
+    PI = "pi"
+
+
+def _write_pid_file() -> bool:
+    """Write current PID to file for stale instance detection.
+
+    Returns:
+        True if the PID file was written successfully, False otherwise.
+    """
+    try:
+        _PID_DIR.mkdir(parents=True, exist_ok=True)
+        _PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _cleanup_pid_file() -> None:
+    """Remove PID file on clean shutdown."""
+    try:
+        _PID_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _check_stale_instance() -> bool:
+    """Check for and clean up stale MCP server instances.
+
+    Returns:
+        True if a stale instance was cleaned up.
+    """
+    try:
+        pid_exists = _PID_FILE.exists()
+    except OSError:
+        return False
+
+    if not pid_exists:
+        return False
+
+    try:
+        old_pid = int(_PID_FILE.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        _cleanup_pid_file()
+        return True
+
+    try:
+        os.kill(old_pid, 0)  # Signal 0 = check existence
+        return False  # Process is alive
+    except ProcessLookupError:
+        _cleanup_pid_file()
+        return True
+    except PermissionError:
+        return False  # Process exists but we can't signal it
+    except OSError:
+        # Windows: os.kill(pid, 0) raises OSError (WinError 87)
+        # since signal 0 is not supported. Treat as stale.
+        _cleanup_pid_file()
+        return True
+
+
+def _ensure_shell_env(*, timeout: float = 10.0) -> None:
+    """Load login-shell environment when launched outside a login shell.
+
+    When an agent host process spawns ``ouroboros mcp serve``,
+    the child inherits only a minimal environment. This sources the user's
+    shell profile to recover PATH, ANTHROPIC_API_KEY, etc.
+
+    Uses JSON serialization to avoid multiline env value parsing issues.
+    Avoids the ``-i`` (interactive) flag which hangs on oh-my-zsh/p10k.
+    """
+    # Fast path: if key indicators are already present, skip
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return
+
+    shell = os.environ.get("SHELL", "/bin/zsh" if sys.platform == "darwin" else "/bin/bash")
+    shell_name = Path(shell).name
+
+    # Dump env as JSON — unambiguous, handles multiline values
+    dump_cmd = 'python3 -c "import os,json,sys; json.dump(dict(os.environ), sys.stdout)"'
+
+    if shell_name == "zsh":
+        cmd = [shell, "-l", "-c", f"[[ -f ~/.zshrc ]] && source ~/.zshrc 2>/dev/null; {dump_cmd}"]
+    elif shell_name == "bash":
+        cmd = [shell, "-l", "-c", f"[[ -f ~/.bashrc ]] && source ~/.bashrc 2>/dev/null; {dump_cmd}"]
+    else:
+        cmd = [shell, "-l", "-c", dump_cmd]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            timeout=timeout,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        _stderr_console.print(f"[yellow]Warning: shell env load failed: {e}[/yellow]")
+        return
+
+    if result.returncode != 0:
+        return
+
+    try:
+        env = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        _stderr_console.print("[yellow]Warning: could not parse shell env output[/yellow]")
+        return
+
+    current_path_dirs = set(os.environ.get("PATH", "").split(os.pathsep))
+    for key, val in env.items():
+        if key == "PATH":
+            new_dirs = [d for d in val.split(os.pathsep) if d and d not in current_path_dirs]
+            if new_dirs:
+                os.environ["PATH"] = (
+                    os.pathsep.join(new_dirs) + os.pathsep + os.environ.get("PATH", "")
+                )
+        elif key not in os.environ:
+            os.environ[key] = val
+
+
+app = typer.Typer(
+    name="mcp",
+    help="MCP (Model Context Protocol) server commands.",
+    no_args_is_help=True,
+)
+
+register_doctor_command(app)
+
+
+async def _run_mcp_server(
+    host: str,
+    port: int,
+    transport: str,
+    db_path: str | None = None,
+    runtime_backend: str | None = None,
+    llm_backend: str | None = None,
+) -> None:
+    """Run the MCP server.
+
+    Args:
+        host: Host to bind to.
+        port: Port to bind to.
+        transport: Transport type (stdio, sse, or streamable-http).
+        db_path: Optional path to EventStore database.
+        runtime_backend: Optional orchestrator runtime backend override.
+        llm_backend: Optional LLM-only backend override.
+    """
+    # Ensure login-shell environment is available (critical for gateway-spawned processes)
+    _ensure_shell_env()
+
+    from ouroboros.mcp.server.adapter import create_ouroboros_server, validate_transport
+    from ouroboros.orchestrator.session import SessionRepository
+    from ouroboros.persistence.brownfield import BrownfieldStore
+    from ouroboros.persistence.event_store import EventStore
+
+    # Validate transport early, before any expensive startup work
+    try:
+        transport = validate_transport(transport)
+    except ValueError:
+        _stderr_console.print(
+            "[red]Invalid transport "
+            f"{transport!r}. Must be 'stdio', 'sse', or 'streamable-http'.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    _console_out = _stderr_console if transport == "stdio" else Console()
+
+    # Create EventStore with custom path if provided
+    if db_path:
+        event_store = EventStore(f"sqlite+aiosqlite:///{db_path}")
+        brownfield_store = BrownfieldStore(f"sqlite+aiosqlite:///{db_path}")
+    else:
+        event_store = EventStore()
+        brownfield_store = BrownfieldStore()
+
+    cleanup_task: asyncio.Task[None] | None = None
+
+    # Initialize the persistent stores up front. The MCP server uses both for
+    # request handling, so a partial init must surface as a clean startup
+    # failure rather than a server that runs with a half-initialized store.
+    await event_store.initialize()
+    await brownfield_store.initialize()
+
+    # Orphan cleanup is intentionally deferred into the background so large
+    # SQLite histories do not block the initial MCP handshake on startup (#304).
+    repo = SessionRepository(event_store)
+
+    async def _run_startup_cleanup() -> None:
+        try:
+            cancelled = await repo.cancel_orphaned_sessions()
+            if cancelled:
+                _console_out.print(
+                    f"[yellow]Auto-cancelled {len(cancelled)} orphaned session(s)[/yellow]"
+                )
+        except Exception as e:
+            # Auto-cleanup is best-effort — don't prevent server startup
+            _console_out.print(f"[yellow]Warning: auto-cleanup failed: {e}[/yellow]")
+
+    cleanup_task = asyncio.create_task(
+        _run_startup_cleanup(),
+        name="ouroboros-mcp-startup-cleanup",
+    )
+
+    # Auto-discover and connect MCP bridge for server-to-server communication
+    from ouroboros.mcp.bridge import create_bridge_from_env
+
+    mcp_bridge = create_bridge_from_env(cwd=Path.cwd())
+    if mcp_bridge is not None:
+        try:
+            results = await mcp_bridge.connect()
+            connected = sum(1 for r in results.values() if r.is_ok)
+            _console_out.print(
+                f"[blue]MCP Bridge: {connected}/{len(results)} upstream server(s) connected[/blue]"
+            )
+        except Exception as e:
+            _console_out.print(f"[yellow]MCP Bridge connection failed: {e}[/yellow]")
+            mcp_bridge = None
+
+    # Create server with all tools pre-registered via dependency injection.
+    # Do NOT re-register OUROBOROS_TOOLS here — create_ouroboros_server already
+    # registers handlers with proper dependencies (event_store, llm_adapter, etc.).
+    server = create_ouroboros_server(
+        name="ouroboros-mcp",
+        version="1.0.0",
+        event_store=event_store,
+        brownfield_store=brownfield_store,
+        runtime_backend=runtime_backend,
+        llm_backend=llm_backend,
+        mcp_bridge=mcp_bridge,
+    )
+
+    tool_count = len(server.info.tools)
+
+    # Detect Codex seatbelt sandbox and warn about network restrictions.
+    _sandbox_network_disabled = os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED") == "1"
+
+    if transport == "stdio":
+        # In stdio mode, stdout is the JSON-RPC channel.
+        # All human-readable output must go to stderr.
+        _stderr_console.print(f"[green]MCP Server starting on {transport}...[/green]")
+        _stderr_console.print(f"[blue]Registered {tool_count} tools[/blue]")
+        _stderr_console.print("[blue]Reading from stdin, writing to stdout[/blue]")
+        _stderr_console.print("[blue]Press Ctrl+C to stop[/blue]")
+    else:
+        print_success(f"MCP Server starting on {transport}...")
+        print_info(f"Registered {tool_count} tools")
+        if transport == "streamable-http":
+            print_info(f"Listening on http://{host}:{port}/mcp")
+        else:
+            print_info(f"Listening on {host}:{port}")
+        print_info("Press Ctrl+C to stop")
+
+    if _sandbox_network_disabled:
+        _console_out.print(
+            "[dim]Note: CODEX_SANDBOX_NETWORK_DISABLED=1 detected. "
+            "MCP-spawned runtimes usually retain network access. "
+            "If agent tasks fail with network errors, try: "
+            "--sandbox danger-full-access[/dim]"
+        )
+
+    # Manage PID file for stale instance detection
+    if _check_stale_instance():
+        if transport == "stdio":
+            _stderr_console.print("[yellow]Cleaned up stale MCP server PID file[/yellow]")
+        else:
+            print_info("Cleaned up stale MCP server PID file")
+
+    _write_pid_file()
+
+    # Start serving with graceful shutdown + orphan reaping.
+    #
+    # asyncio.run() only translates SIGINT into KeyboardInterrupt; an unhandled
+    # SIGTERM would terminate the process immediately and skip the finally block
+    # below — leaking the PID file and, more importantly, skipping the
+    # EventStore.close() WAL TRUNCATE checkpoint (the -wal file then grows
+    # unbounded across many concurrent sessions). Install explicit handlers and
+    # race the serve task against a stop Event so every shutdown path is clean.
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _request_stop(signame: str) -> None:
+        _console_out.print(f"[blue]Received {signame}, shutting down...[/blue]")
+        stop.set()
+
+    # Resolve signals by name: SIGHUP is POSIX-only, so referencing
+    # ``signal.SIGHUP`` directly would raise AttributeError while *building* the
+    # loop iterable on Windows — before the suppress() below could catch it.
+    # getattr keeps SIGHUP on POSIX and skips it where the constant is absent.
+    for _signame in ("SIGTERM", "SIGINT", "SIGHUP"):
+        _sig = getattr(signal, _signame, None)
+        if _sig is None:
+            continue
+        # add_signal_handler is unavailable on some event loops (e.g. the
+        # Windows Proactor loop); fall back silently — KeyboardInterrupt still
+        # covers SIGINT there.
+        with contextlib.suppress(NotImplementedError, ValueError, RuntimeError):
+            loop.add_signal_handler(_sig, _request_stop, _sig.name)
+
+    # Parent-death watchdog: when the MCP client that spawned us dies, this
+    # process is reparented away from its original parent so a vanished client
+    # never leaves an orphaned server pinning the SQLite database (the
+    # streamable-http case in particular has no stdin EOF to rely on). macOS
+    # lacks Linux's PR_SET_PDEATHSIG, so we poll getppid() — a POSIX best-effort
+    # backstop. We compare against the *original* ppid rather than testing
+    # ``== 1`` so detection still fires under a child-subreaper (systemd --user,
+    # tini, some container runtimes) where the orphan reparents to the subreaper
+    # rather than to pid 1. Skipped when launched already-detached on purpose
+    # (orig_ppid is already 1, e.g. a real launchd/systemd service). Not
+    # effective on Windows (no reparent-on-death model); SIGINT/stdin EOF cover
+    # the common cases there.
+    orig_ppid = os.getppid()
+
+    async def _orphan_watchdog() -> None:
+        if orig_ppid == 1:
+            return
+        while not stop.is_set():
+            if os.getppid() != orig_ppid:
+                _console_out.print("[yellow]Parent client gone — orphan exit[/yellow]")
+                stop.set()
+                return
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=5.0)
+
+    serve_task = asyncio.create_task(
+        server.serve(transport=transport, host=host, port=port),
+        name="ouroboros-mcp-serve",
+    )
+    stop_task = asyncio.create_task(stop.wait(), name="ouroboros-mcp-stop")
+    watchdog_task = asyncio.create_task(_orphan_watchdog(), name="ouroboros-mcp-watchdog")
+
+    serve_exc: BaseException | None = None
+    try:
+        await asyncio.wait(
+            {serve_task, stop_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        # When the serve loop itself is what finished (rather than a stop
+        # signal), preserve any failure it raised. asyncio.wait() leaves the
+        # exception parked on the task, so a bind/listen/runtime error from
+        # server.serve() would otherwise be discarded by the suppressing
+        # cleanup below and reported as a clean shutdown. A normal serve return
+        # or a stop-driven shutdown leaves serve_exc None.
+        if serve_task.done() and not serve_task.cancelled():
+            serve_exc = serve_task.exception()
+    finally:
+        # Runs for SIGTERM, orphan-exit and KeyboardInterrupt too, so
+        # EventStore.close() always gets to collapse the WAL. Cancel the serve
+        # loop and helpers, then release the persistent stores in reverse init
+        # order. Draining under suppress() guarantees cleanup is never skipped;
+        # the genuine serve-loop outcome is re-inspected afterwards.
+        for _task in (serve_task, watchdog_task, stop_task):
+            if not _task.done():
+                _task.cancel()
+        for _task in (serve_task, watchdog_task, stop_task):
+            with contextlib.suppress(BaseException):
+                await _task
+        if cleanup_task is not None and not cleanup_task.done():
+            cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cleanup_task
+        # Route teardown through the adapter so its owned resources close in the
+        # documented order: the ControlBus reactive surface is drained first
+        # (cancelling subscriber tasks), then the EventStore (whose close()
+        # collapses the WAL) and BrownfieldStore, then the MCP bridge. Closing
+        # the stores directly here would bypass that contract and leave
+        # control-bus tasks and upstream bridge connections dangling. Best
+        # effort — a drain/close failure is already logged inside shutdown();
+        # never let it escape the cleanup path.
+        with contextlib.suppress(Exception):
+            await server.shutdown()
+        _cleanup_pid_file()
+        # Surface an abnormal serve-loop termination. A cancellation is the
+        # intended shutdown path (SIGTERM/orphan-exit/stdin EOF), but any other
+        # exception means the transport loop itself crashed — re-raise it after
+        # cleanup so the command exits non-zero with a trace instead of a silent
+        # exit 0 that would hide exactly the failure class this server must report.
+        if not serve_task.cancelled():
+            serve_exc = serve_task.exception()
+            if serve_exc is not None:
+                raise serve_exc
+
+    # Surface a serve-loop failure only after cleanup has collapsed the WAL and
+    # released the stores. This restores the error-propagation contract of the
+    # prior ``await server.serve(...)`` so ``ouroboros mcp serve`` exits non-zero
+    # on startup/runtime failures instead of reporting a clean stop.
+    if serve_exc is not None:
+        raise serve_exc
+
+
+@app.command()
+def serve(
+    host: Annotated[
+        str,
+        typer.Option(
+            "--host",
+            "-h",
+            help="Host to bind to.",
+        ),
+    ] = "localhost",
+    port: Annotated[
+        int,
+        typer.Option(
+            "--port",
+            "-p",
+            help="Port to bind to.",
+        ),
+    ] = 8080,
+    transport: Annotated[
+        str,
+        typer.Option(
+            "--transport",
+            "-t",
+            help="Transport type: stdio, sse, or streamable-http.",
+        ),
+    ] = "stdio",
+    db: Annotated[
+        str,
+        typer.Option(
+            "--db",
+            help="Path to EventStore database (default: ~/.ouroboros/ouroboros.db)",
+        ),
+    ] = "",
+    runtime: Annotated[
+        AgentRuntimeBackend | None,
+        typer.Option(
+            "--runtime",
+            help="Agent runtime backend for orchestrator-driven tools (claude, codex, opencode, hermes, gemini, copilot, goose, kiro, or pi).",
+            case_sensitive=False,
+        ),
+    ] = None,
+    llm_backend: Annotated[
+        LLMBackend | None,
+        typer.Option(
+            "--llm-backend",
+            help=(
+                "LLM backend for interview/seed/evaluation tools (claude_code, litellm, codex, copilot, opencode, gemini, goose, kiro, or pi)."
+            ),
+            case_sensitive=False,
+        ),
+    ] = None,
+) -> None:
+    """Start the MCP server.
+
+    Exposes Ouroboros functionality via Model Context Protocol,
+    allowing Claude Desktop and other MCP clients to interact
+    with Ouroboros.
+
+    Available tools:
+    - ouroboros_execute_seed: Execute a seed specification
+    - ouroboros_session_status: Get session status
+    - ouroboros_query_events: Query event history
+
+    Examples:
+
+        # Start with stdio transport (for Claude Desktop)
+        ouroboros mcp serve
+
+        # Start with SSE transport on custom port
+        ouroboros mcp serve --transport sse --port 9000
+
+        # Start with streamable HTTP transport for Codex CLI --url clients
+        ouroboros mcp serve --transport streamable-http --port 9000
+
+        # Start with OpenCode runtime
+        ouroboros mcp serve --runtime opencode
+
+        # Use Codex CLI for LLM-only tools as well
+        ouroboros mcp serve --runtime codex --llm-backend codex
+
+    """
+    # Guard: prevent recursive MCP server spawning.
+    # When ouroboros spawns a runtime (Codex/Claude/OpenCode), the child process
+    # inherits this env var. If that runtime's MCP config tries to spawn another
+    # ouroboros server, the nested instance exits cleanly instead of creating a
+    # process tree explosion.
+    if os.environ.get("_OUROBOROS_NESTED"):
+        _stderr_console.print("[dim]Nested ouroboros MCP server detected — exiting cleanly[/dim]")
+        raise typer.Exit(0)
+    os.environ["_OUROBOROS_NESTED"] = "1"
+
+    try:
+        db_path = db if db else None
+        asyncio.run(
+            _run_mcp_server(
+                host,
+                port,
+                transport,
+                db_path,
+                runtime.value if runtime else None,
+                llm_backend.value if llm_backend else None,
+            )
+        )
+    except KeyboardInterrupt:
+        _stderr_console.print("[blue]MCP Server stopped[/blue]")
+    except ImportError as e:
+        _stderr_console.print(f"[red]MCP dependencies not installed: {e}[/red]")
+        _stderr_console.print("[blue]Install with: uv add mcp[/blue]")
+        raise typer.Exit(1) from e
+    except OSError as e:
+        _stderr_console.print(f"[red]MCP Server failed to start: {e}[/red]")
+        _stderr_console.print(
+            "[blue]If this keeps happening, try:\n"
+            "  1. Check if another MCP server is running: cat ~/.ouroboros/mcp-server.pid\n"
+            "  2. Kill stale process: kill $(cat ~/.ouroboros/mcp-server.pid)\n"
+            "  3. Remove stale PID: rm ~/.ouroboros/mcp-server.pid\n"
+            "  4. Restart your MCP client[/blue]"
+        )
+        raise typer.Exit(1) from e
+
+
+@app.command()
+def info(
+    runtime: Annotated[
+        AgentRuntimeBackend | None,
+        typer.Option(
+            "--runtime",
+            help="Agent runtime backend for orchestrator-driven tools (claude, codex, opencode, hermes, gemini, copilot, goose, kiro, or pi).",
+            case_sensitive=False,
+        ),
+    ] = None,
+    llm_backend: Annotated[
+        LLMBackend | None,
+        typer.Option(
+            "--llm-backend",
+            help=(
+                "LLM backend for interview/seed/evaluation tools (claude_code, litellm, codex, copilot, opencode, gemini, goose, kiro, or pi)."
+            ),
+            case_sensitive=False,
+        ),
+    ] = None,
+) -> None:
+    """Show MCP server information and available tools."""
+    from ouroboros.cli.formatters import console
+    from ouroboros.mcp.server.adapter import create_ouroboros_server
+
+    # Create server with all tools pre-registered
+    server = create_ouroboros_server(
+        name="ouroboros-mcp",
+        version="1.0.0",
+        runtime_backend=runtime.value if runtime else None,
+        llm_backend=llm_backend.value if llm_backend else None,
+    )
+
+    server_info = server.info
+
+    console.print()
+    console.print("[bold]MCP Server Information[/bold]")
+    console.print(f"  Name: {server_info.name}")
+    console.print(f"  Version: {server_info.version}")
+    console.print()
+
+    console.print("[bold]Capabilities[/bold]")
+    console.print(f"  Tools: {server_info.capabilities.tools}")
+    console.print(f"  Resources: {server_info.capabilities.resources}")
+    console.print(f"  Prompts: {server_info.capabilities.prompts}")
+    console.print()
+
+    console.print("[bold]Available Tools[/bold]")
+    for tool in server_info.tools:
+        console.print(f"  [green]{tool.name}[/green]")
+        console.print(f"    {tool.description}")
+        if tool.parameters:
+            console.print("    Parameters:")
+            for param in tool.parameters:
+                required = "[red]*[/red]" if param.required else ""
+                console.print(f"      - {param.name}{required}: {param.description}")
+        console.print()
+
+
+__all__ = ["app"]

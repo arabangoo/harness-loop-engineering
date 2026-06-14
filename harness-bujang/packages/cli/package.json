@@ -1,0 +1,63 @@
+{
+  "name": "harness-bujang",
+  "version": "0.9.2",
+  "description": "Install the Harness-Bujang multi-agent harness into any project — Director, 16 specialist teams, standalone localhost chat-room viewer. Korean and English personas. Works with Claude Code, Cursor, Cline, Aider, Codex, Gemini, or any tool that reads .claude/agents/. Zero project intrusion (no next.config patching, no native peer-dep auto-install).",
+  "keywords": [
+    "claude-code",
+    "claude",
+    "agents",
+    "subagent",
+    "harness",
+    "multi-agent",
+    "orchestration",
+    "scaffold",
+    "init",
+    "korean",
+    "bujang",
+    "anthropic"
+  ],
+  "author": "bjcho4141",
+  "license": "MIT",
+  "homepage": "https://github.com/bjcho4141/harness-bujang#readme",
+  "bugs": {
+    "url": "https://github.com/bjcho4141/harness-bujang/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bjcho4141/harness-bujang.git",
+    "directory": "packages/cli"
+  },
+  "type": "module",
+  "bin": {
+    "harness-bujang": "./dist/index.js",
+    "bujang": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "templates",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prepare-templates": "node scripts/prepare-templates.mjs",
+    "build": "npm run prepare-templates && tsup src/index.ts --format esm --target node20 --clean --shims",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "sandbox-test": "bash scripts/sandbox-test.sh",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.10",
+    "@types/node": "^20.11.0",
+    "tsup": "^8.3.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^8.4.2",
+    "better-sqlite3": "^11.7.0"
+  }
+}

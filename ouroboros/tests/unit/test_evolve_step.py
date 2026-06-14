@@ -1,0 +1,1439 @@
+"""Unit tests for evolve_step() — single-generation stepping API."""
+
+import inspect
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from ouroboros.config.models import RuntimeControlsConfig
+from ouroboros.core.directive import Directive
+from ouroboros.core.errors import OuroborosError
+from ouroboros.core.lineage import (
+    EvaluationSummary,
+    FeedbackMetadata,
+    GenerationPhase,
+    GenerationRecord,
+    LineageStatus,
+    OntologyDelta,
+    OntologyLineage,
+)
+from ouroboros.core.seed import (
+    EvaluationPrinciple,
+    ExitCondition,
+    OntologyField,
+    OntologySchema,
+    Seed,
+    SeedMetadata,
+)
+from ouroboros.core.types import Result
+from ouroboros.core.worktree import WorktreeError
+from ouroboros.events.lineage import (
+    lineage_created,
+    lineage_generation_completed,
+    lineage_generation_failed,
+    lineage_generation_phase_changed,
+    lineage_generation_started,
+)
+from ouroboros.evolution.convergence import ConvergenceSignal
+from ouroboros.evolution.loop import (
+    EvolutionaryLoop,
+    EvolutionaryLoopConfig,
+    GenerationResult,
+    StepAction,
+    StepResult,
+)
+from ouroboros.evolution.projector import LineageProjector
+from ouroboros.evolution.reflect import ReflectOutput
+from ouroboros.evolution.watchdog import GenerationWatchdogTimeout
+from ouroboros.evolution.wonder import WonderOutput
+from ouroboros.mcp.server.adapter import _extract_feedback_metadata_from_artifact
+from ouroboros.persistence.event_store import EventStore
+
+# -- Helpers --
+
+_RUNTIME_CONTROL_ENV_KEYS = (
+    "OUROBOROS_MCP_TOOL_TIMEOUT_SECONDS",
+    "OUROBOROS_GENERATION_IDLE_TIMEOUT_SECONDS",
+    "OUROBOROS_GENERATION_NO_PROGRESS_TIMEOUT_SECONDS",
+    "OUROBOROS_GENERATION_SAFETY_TIMEOUT_SECONDS",
+    "OUROBOROS_WATCHDOG_POLL_SECONDS",
+    "OUROBOROS_GENERATION_TIMEOUT",
+)
+
+
+def _clear_runtime_control_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for env_key in _RUNTIME_CONTROL_ENV_KEYS:
+        monkeypatch.delenv(env_key, raising=False)
+
+
+def make_seed(
+    goal: str = "Build a task manager",
+    seed_id: str = "seed_001",
+    parent_seed_id: str | None = None,
+    ontology_name: str = "TaskManager",
+    fields: tuple[OntologyField, ...] | None = None,
+) -> Seed:
+    """Create a test Seed."""
+    if fields is None:
+        fields = (
+            OntologyField(
+                name="tasks",
+                field_type="array",
+                description="List of task objects",
+                required=True,
+            ),
+        )
+    return Seed(
+        goal=goal,
+        task_type="code",
+        constraints=("Python 3.14+",),
+        acceptance_criteria=("Tasks can be created",),
+        ontology_schema=OntologySchema(
+            name=ontology_name,
+            description=f"{ontology_name} domain model",
+            fields=fields,
+        ),
+        evaluation_principles=(
+            EvaluationPrinciple(
+                name="completeness",
+                description="All requirements implemented",
+                weight=1.0,
+            ),
+        ),
+        exit_conditions=(
+            ExitCondition(
+                name="all_criteria_met",
+                description="All acceptance criteria pass",
+                evaluation_criteria="100% criteria satisfied",
+            ),
+        ),
+        metadata=SeedMetadata(
+            seed_id=seed_id,
+            parent_seed_id=parent_seed_id,
+            ambiguity_score=0.1,
+        ),
+    )
+
+
+def make_eval_summary(approved: bool = True, score: float = 0.85) -> EvaluationSummary:
+    """Create a test EvaluationSummary."""
+    return EvaluationSummary(
+        final_approved=approved,
+        highest_stage_passed=2,
+        score=score,
+    )
+
+
+def make_wonder_output(
+    questions: tuple[str, ...] = ("What about edge cases?",),
+    should_continue: bool = True,
+) -> WonderOutput:
+    """Create a test WonderOutput."""
+    return WonderOutput(
+        questions=questions,
+        ontology_tensions=(),
+        should_continue=should_continue,
+        reasoning="Test reasoning",
+    )
+
+
+async def create_event_store() -> EventStore:
+    """Create an in-memory EventStore for testing."""
+    store = EventStore("sqlite+aiosqlite:///:memory:")
+    await store.initialize()
+    return store
+
+
+def make_loop(
+    event_store: EventStore,
+    gen_result: GenerationResult | None = None,
+    gen_error: OuroborosError | None = None,
+) -> EvolutionaryLoop:
+    """Create an EvolutionaryLoop with mocked engines.
+
+    Args:
+        event_store: The event store to use.
+        gen_result: If provided, _run_generation returns this.
+        gen_error: If provided, _run_generation returns this error.
+    """
+    loop = EvolutionaryLoop(
+        event_store=event_store,
+        config=EvolutionaryLoopConfig(
+            max_generations=30,
+            convergence_threshold=0.95,
+            stagnation_window=3,
+            min_generations=2,
+        ),
+    )
+
+    if gen_result is not None:
+        loop._run_generation = AsyncMock(return_value=Result.ok(gen_result))
+    elif gen_error is not None:
+        loop._run_generation = AsyncMock(return_value=Result.err(gen_error))
+
+    return loop
+
+
+def make_watchdog_timeout(
+    timeout_kind: str,
+    lineage_id: str,
+    generation_number: int = 1,
+) -> GenerationWatchdogTimeout:
+    """Create a watchdog timeout with the fields emitted by the real watchdog."""
+    return GenerationWatchdogTimeout(
+        timeout_kind=timeout_kind,
+        reason=f"synthetic {timeout_kind}",
+        details={
+            "timeout_kind": timeout_kind,
+            "lineage_id": lineage_id,
+            "generation_number": generation_number,
+            "execution_id": f"evolve:{lineage_id}:generation:{generation_number}",
+            "elapsed_seconds": 10.0,
+            "idle_seconds": 7.0,
+            "no_material_progress_seconds": 5.0,
+            "activity_event_count": 2,
+            "material_event_count": 0,
+        },
+    )
+
+
+async def seed_events_for_gen1(
+    event_store: EventStore,
+    lineage_id: str,
+    seed: Seed,
+    eval_summary: EvaluationSummary | None = None,
+) -> None:
+    """Populate EventStore with Gen 1 events."""
+    await event_store.append(lineage_created(lineage_id, seed.goal))
+    await event_store.append(
+        lineage_generation_completed(
+            lineage_id,
+            generation_number=1,
+            seed_id=seed.metadata.seed_id,
+            ontology_snapshot=seed.ontology_schema.model_dump(mode="json"),
+            evaluation_summary=eval_summary.model_dump(mode="json") if eval_summary else None,
+            wonder_questions=["Initial question"],
+            seed_json=json.dumps(seed.to_dict()),
+        )
+    )
+
+
+# -- Test Classes --
+
+
+class TestEvolutionaryLoopConfig:
+    """Test evolutionary loop config compatibility behavior."""
+
+    def test_default_runtime_controls_honor_legacy_generation_timeout_env(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _clear_runtime_control_env(monkeypatch)
+        monkeypatch.setenv("OUROBOROS_GENERATION_TIMEOUT", "43200")
+
+        config = EvolutionaryLoopConfig()
+
+        assert config.runtime_controls.generation_no_progress_timeout_seconds == 43200
+
+    def test_explicit_generation_timeout_overrides_runtime_controls(self) -> None:
+        config = EvolutionaryLoopConfig(
+            generation_timeout_seconds=123,
+            runtime_controls=RuntimeControlsConfig(
+                generation_no_progress_timeout_seconds=456,
+            ),
+        )
+
+        assert config.runtime_controls.generation_no_progress_timeout_seconds == 123
+
+    def test_explicit_runtime_controls_are_preserved(self) -> None:
+        controls = RuntimeControlsConfig(
+            generation_idle_timeout_seconds=77,
+            generation_no_progress_timeout_seconds=88,
+            watchdog_poll_seconds=2,
+        )
+
+        config = EvolutionaryLoopConfig(runtime_controls=controls)
+
+        assert config.runtime_controls == controls
+
+    def test_non_introspectable_executor_preserves_legacy_call_shape(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        executor = object()
+
+        def raise_for_executor(callable_obj: object) -> inspect.Signature:
+            if callable_obj is executor:
+                raise ValueError("no signature")
+            return inspect.Signature()
+
+        monkeypatch.setattr("ouroboros.evolution.loop.inspect.signature", raise_for_executor)
+
+        assert EvolutionaryLoop._callable_accepts_keyword(executor, "execution_id") is False
+
+
+class TestStepTypes:
+    """Test StepAction and StepResult types."""
+
+    def test_step_action_values(self) -> None:
+        """StepAction has all expected values."""
+        assert StepAction.CONTINUE == "continue"
+        assert StepAction.CONVERGED == "converged"
+        assert StepAction.STAGNATED == "stagnated"
+        assert StepAction.EXHAUSTED == "exhausted"
+        assert StepAction.FAILED == "failed"
+        assert StepAction.INTERRUPTED == "interrupted"
+        assert len(StepAction) == 6
+
+    def test_step_result_is_frozen(self) -> None:
+        """StepResult is frozen dataclass."""
+        seed = make_seed()
+        gen_result = GenerationResult(
+            generation_number=1,
+            seed=seed,
+        )
+        signal = ConvergenceSignal(
+            converged=False,
+            reason="Test",
+            ontology_similarity=0.5,
+            generation=1,
+        )
+        lineage = OntologyLineage(lineage_id="test", goal="test")
+        step = StepResult(
+            generation_result=gen_result,
+            convergence_signal=signal,
+            lineage=lineage,
+            action=StepAction.CONTINUE,
+            next_generation=2,
+        )
+        assert step.action == StepAction.CONTINUE
+        assert step.next_generation == 2
+
+        with pytest.raises(AttributeError):
+            step.action = StepAction.CONVERGED  # type: ignore[misc]
+
+
+class TestEvolveStepGen1:
+    """Test evolve_step for Gen 1 (new lineage)."""
+
+    @pytest.mark.asyncio
+    async def test_gen1_creates_lineage(self) -> None:
+        """Gen 1 with initial_seed creates lineage and runs."""
+        store = await create_event_store()
+        seed = make_seed()
+
+        gen_result = GenerationResult(
+            generation_number=1,
+            seed=seed,
+            evaluation_summary=make_eval_summary(),
+            phase=GenerationPhase.COMPLETED,
+            success=True,
+        )
+        loop = make_loop(store, gen_result=gen_result)
+
+        result = await loop.evolve_step("lin_test_001", initial_seed=seed)
+
+        assert result.is_ok
+        step = result.value
+        assert step.action == StepAction.CONTINUE
+        assert step.generation_result.generation_number == 1
+        assert step.lineage.lineage_id == "lin_test_001"
+        assert step.lineage.current_generation == 1
+        assert step.next_generation == 2
+
+    @pytest.mark.asyncio
+    async def test_gen1_emits_events(self) -> None:
+        """Gen 1 emits lineage_created and lineage_generation_completed with seed_json."""
+        store = await create_event_store()
+        seed = make_seed()
+
+        gen_result = GenerationResult(
+            generation_number=1,
+            seed=seed,
+            phase=GenerationPhase.COMPLETED,
+            success=True,
+        )
+        loop = make_loop(store, gen_result=gen_result)
+
+        await loop.evolve_step("lin_test_events", initial_seed=seed)
+
+        events = await store.replay_lineage("lin_test_events")
+        event_types = [e.type for e in events]
+        assert "lineage.created" in event_types
+        assert "lineage.generation.completed" in event_types
+
+        # Verify seed_json is in the completed event
+        completed = [e for e in events if e.type == "lineage.generation.completed"][0]
+        assert "seed_json" in completed.data
+        assert completed.data["seed_json"] is not None
+
+        # Verify round-trip
+        reconstructed = Seed.from_dict(json.loads(completed.data["seed_json"]))
+        assert reconstructed.goal == seed.goal
+        assert reconstructed.metadata.seed_id == seed.metadata.seed_id
+
+    @pytest.mark.asyncio
+    async def test_gen1_executor_receives_deterministic_execution_id(self) -> None:
+        """Evolve execution events are scoped so the watchdog can monitor them."""
+        store = await create_event_store()
+        seed = make_seed()
+        observed: dict[str, object] = {}
+
+        async def executor(
+            received_seed: Seed,
+            *,
+            parallel: bool = True,
+            execution_id: str | None = None,
+        ) -> str:
+            observed["seed"] = received_seed
+            observed["parallel"] = parallel
+            observed["execution_id"] = execution_id
+            return "Execution complete"
+
+        loop = EvolutionaryLoop(
+            event_store=store,
+            config=EvolutionaryLoopConfig(
+                min_generations=1,
+                runtime_controls=RuntimeControlsConfig(
+                    generation_idle_timeout_seconds=0,
+                    generation_no_progress_timeout_seconds=0,
+                    watchdog_poll_seconds=0.01,
+                ),
+            ),
+            executor=executor,
+        )
+
+        result = await loop.evolve_step(
+            lineage_id="lin_exec_scope",
+            initial_seed=seed,
+            execute=True,
+            parallel=False,
+        )
+
+        assert result.is_ok
+        assert observed["seed"] == seed
+        assert observed["parallel"] is False
+        assert observed["execution_id"] == "evolve:lin_exec_scope:generation:1"
+
+    @pytest.mark.asyncio
+    async def test_gen1_records_depth_warning_as_seed_quality_canary_feedback(self) -> None:
+        """Evaluate-stage depth warnings should reach loop canary state unchanged."""
+        store = await create_event_store()
+        seed = make_seed()
+        expected_warning = FeedbackMetadata(
+            code="decomposition_depth_warning",
+            severity="warning",
+            message="Depth safety net forced atomic execution.",
+            source="parallel_executor",
+            details={"max_depth": 3, "affected_count": 2},
+        )
+        artifact = """
+Parallel Execution Verification Report
+Success: 1/1
+
+## Feedback Metadata
+Feedback Metadata JSON: {"feedback_metadata": [{"code": "decomposition_depth_warning", "details": {"affected_count": 2, "max_depth": 3}, "message": "Depth safety net forced atomic execution.", "severity": "warning", "source": "parallel_executor"}]}
+
+## AC Results
+### AC 1: [PASS] Tasks can be created
+""".strip()
+
+        async def fake_executor(*_args, **_kwargs):
+            return Result.ok(
+                SimpleNamespace(
+                    summary={"verification_report": artifact},
+                    final_message="unused",
+                    duration_seconds=0.01,
+                    messages_processed=1,
+                    success=True,
+                )
+            )
+
+        async def fake_evaluator(_seed: Seed, execution_output: str | None) -> EvaluationSummary:
+            assert execution_output == artifact
+            return EvaluationSummary(
+                final_approved=True,
+                highest_stage_passed=3,
+                score=1.0,
+                feedback_metadata=_extract_feedback_metadata_from_artifact(execution_output or ""),
+            )
+
+        loop = EvolutionaryLoop(
+            event_store=store,
+            config=EvolutionaryLoopConfig(
+                max_generations=30,
+                convergence_threshold=0.95,
+                stagnation_window=3,
+                min_generations=2,
+            ),
+            executor=fake_executor,
+            evaluator=fake_evaluator,
+        )
+
+        result = await loop.evolve_step("lin_test_canary", initial_seed=seed)
+
+        assert result.is_ok
+        step = result.value
+        assert step.generation_result.evaluation_summary is not None
+        assert step.generation_result.evaluation_summary.feedback_metadata == (expected_warning,)
+        assert step.lineage.generations[0].seed_quality_canary_feedback == (expected_warning,)
+
+        events = await store.replay_lineage("lin_test_canary")
+        completed = [e for e in events if e.type == "lineage.generation.completed"][0]
+        assert completed.data["seed_quality_canary_feedback"] == [
+            expected_warning.model_dump(mode="json")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_gen1_omits_seed_quality_canary_feedback_without_depth_warning(self) -> None:
+        """Loop canary state stays empty when evaluation emits no depth warning."""
+        store = await create_event_store()
+        seed = make_seed()
+        artifact = """
+Parallel Execution Verification Report
+Success: 1/1
+
+## AC Results
+### AC 1: [PASS] Tasks can be created
+""".strip()
+
+        async def fake_executor(*_args, **_kwargs):
+            return Result.ok(
+                SimpleNamespace(
+                    summary={"verification_report": artifact},
+                    final_message="unused",
+                    duration_seconds=0.01,
+                    messages_processed=1,
+                    success=True,
+                )
+            )
+
+        async def fake_evaluator(_seed: Seed, execution_output: str | None) -> EvaluationSummary:
+            assert execution_output == artifact
+            return EvaluationSummary(
+                final_approved=True,
+                highest_stage_passed=3,
+                score=1.0,
+                feedback_metadata=_extract_feedback_metadata_from_artifact(execution_output or ""),
+            )
+
+        loop = EvolutionaryLoop(
+            event_store=store,
+            config=EvolutionaryLoopConfig(
+                max_generations=30,
+                convergence_threshold=0.95,
+                stagnation_window=3,
+                min_generations=2,
+            ),
+            executor=fake_executor,
+            evaluator=fake_evaluator,
+        )
+
+        result = await loop.evolve_step("lin_test_no_canary", initial_seed=seed)
+
+        assert result.is_ok
+        step = result.value
+        assert step.generation_result.evaluation_summary is not None
+        assert step.generation_result.evaluation_summary.feedback_metadata == ()
+        assert step.lineage.generations[0].seed_quality_canary_feedback == ()
+
+        events = await store.replay_lineage("lin_test_no_canary")
+        completed = [e for e in events if e.type == "lineage.generation.completed"][0]
+        assert "seed_quality_canary_feedback" not in completed.data
+
+
+class TestEvolveStepGen2:
+    """Test evolve_step for Gen 2+ (reconstructed from events)."""
+
+    @pytest.mark.asyncio
+    async def test_gen2_reconstructs_from_events(self) -> None:
+        """Gen 2+ reconstructs seed from events and runs next generation."""
+        store = await create_event_store()
+        seed_v1 = make_seed(seed_id="seed_v1")
+        eval_summary = make_eval_summary()
+
+        # Seed Gen 1 events
+        await seed_events_for_gen1(store, "lin_gen2_test", seed_v1, eval_summary)
+
+        # Gen 2 result with evolved seed
+        seed_v2 = make_seed(
+            seed_id="seed_v2",
+            parent_seed_id="seed_v1",
+            fields=(
+                OntologyField(name="tasks", field_type="array", description="Tasks", required=True),
+                OntologyField(
+                    name="projects", field_type="array", description="Projects", required=True
+                ),
+            ),
+        )
+        gen_result = GenerationResult(
+            generation_number=2,
+            seed=seed_v2,
+            evaluation_summary=make_eval_summary(),
+            wonder_output=make_wonder_output(),
+            ontology_delta=OntologyDelta(
+                added_fields=(
+                    OntologyField(
+                        name="projects", field_type="array", description="Projects", required=True
+                    ),
+                ),
+                removed_fields=(),
+                modified_fields=(),
+                similarity=0.7,
+            ),
+            phase=GenerationPhase.COMPLETED,
+            success=True,
+        )
+        loop = make_loop(store, gen_result=gen_result)
+
+        result = await loop.evolve_step("lin_gen2_test")
+
+        assert result.is_ok
+        step = result.value
+        assert step.generation_result.generation_number == 2
+        assert step.next_generation == 3
+
+        # Verify _run_generation was called with reconstructed seed
+        loop._run_generation.assert_called_once()
+        call_args = loop._run_generation.call_args
+        passed_seed = call_args.kwargs.get("current_seed") or call_args[0][2]
+        assert passed_seed.metadata.seed_id == "seed_v1"
+
+
+class TestEvolveStepConvergence:
+    """Test convergence/stagnation/exhaustion detection."""
+
+    @pytest.mark.asyncio
+    async def test_convergence_detected(self) -> None:
+        """When ontology similarity >= threshold after genuine evolution, action=CONVERGED."""
+        store = await create_event_store()
+
+        # Gen 1: different ontology (to show genuine evolution occurred)
+        seed_v1 = make_seed(
+            seed_id="seed_conv_1",
+            ontology_name="TaskManagerV1",
+            fields=(
+                OntologyField(
+                    name="items",
+                    field_type="array",
+                    description="List of items",
+                    required=True,
+                ),
+            ),
+        )
+        # Gen 2: evolved ontology (standard schema)
+        seed_v2 = make_seed(seed_id="seed_conv_2", parent_seed_id="seed_conv_1")
+
+        await store.append(lineage_created("lin_conv", seed_v1.goal))
+        await store.append(
+            lineage_generation_completed(
+                "lin_conv",
+                1,
+                seed_v1.metadata.seed_id,
+                seed_v1.ontology_schema.model_dump(mode="json"),
+                make_eval_summary().model_dump(mode="json"),
+                ["Q1"],
+                json.dumps(seed_v1.to_dict()),
+            )
+        )
+        await store.append(
+            lineage_generation_completed(
+                "lin_conv",
+                2,
+                seed_v2.metadata.seed_id,
+                seed_v2.ontology_schema.model_dump(mode="json"),
+                make_eval_summary().model_dump(mode="json"),
+                ["Q2"],
+                json.dumps(seed_v2.to_dict()),
+            )
+        )
+
+        # Gen 3 returns identical ontology to Gen 2 (similarity=1.0)
+        seed_v3 = make_seed(seed_id="seed_conv_3", parent_seed_id="seed_conv_2")
+        gen_result = GenerationResult(
+            generation_number=3,
+            seed=seed_v3,
+            evaluation_summary=make_eval_summary(),
+            wonder_output=make_wonder_output(should_continue=False),
+            ontology_delta=OntologyDelta(similarity=1.0),
+            phase=GenerationPhase.COMPLETED,
+            success=True,
+        )
+        loop = make_loop(store, gen_result=gen_result)
+
+        result = await loop.evolve_step("lin_conv")
+
+        assert result.is_ok
+        step = result.value
+        assert step.action == StepAction.CONVERGED
+        assert step.convergence_signal.converged
+
+    @pytest.mark.asyncio
+    async def test_stagnation_emits_unstuck_and_keeps_lineage_resumable(self) -> None:
+        """Stagnation routes to UNSTUCK rather than terminal convergence."""
+        store = await create_event_store()
+        seed_v1 = make_seed(
+            seed_id="seed_stag_1",
+            ontology_name="TaskManagerA",
+            fields=(
+                OntologyField(
+                    name="items",
+                    field_type="array",
+                    description="List of items",
+                    required=True,
+                ),
+            ),
+        )
+        seed_v2 = make_seed(
+            seed_id="seed_stag_2",
+            parent_seed_id="seed_stag_1",
+            ontology_name="TaskManagerB",
+            fields=(
+                OntologyField(
+                    name="tasks",
+                    field_type="array",
+                    description="List of tasks",
+                    required=True,
+                ),
+            ),
+        )
+        seed_v3 = make_seed(
+            seed_id="seed_stag_3",
+            parent_seed_id="seed_stag_2",
+            ontology_name="TaskManagerA",
+            fields=seed_v1.ontology_schema.fields,
+        )
+
+        await store.append(lineage_created("lin_stag", seed_v1.goal))
+        for generation, seed in enumerate((seed_v1, seed_v2, seed_v3), 1):
+            await store.append(
+                lineage_generation_completed(
+                    "lin_stag",
+                    generation,
+                    seed.metadata.seed_id,
+                    seed.ontology_schema.model_dump(mode="json"),
+                    make_eval_summary(score=0.85).model_dump(mode="json"),
+                    [f"Q{generation}"],
+                    json.dumps(seed.to_dict()),
+                )
+            )
+
+        seed_v4 = make_seed(
+            seed_id="seed_stag_4",
+            parent_seed_id="seed_stag_3",
+            ontology_name="TaskManagerB",
+            fields=seed_v2.ontology_schema.fields,
+        )
+        gen_result = GenerationResult(
+            generation_number=4,
+            seed=seed_v4,
+            evaluation_summary=make_eval_summary(score=0.85),
+            wonder_output=make_wonder_output(),
+            ontology_delta=OntologyDelta(similarity=0.0),
+            phase=GenerationPhase.COMPLETED,
+            success=True,
+        )
+        loop = make_loop(store, gen_result=gen_result)
+
+        result = await loop.evolve_step("lin_stag")
+
+        assert result.is_ok
+        step = result.value
+        assert step.action == StepAction.STAGNATED
+        assert step.lineage.status == LineageStatus.ACTIVE
+
+        events = await store.replay_lineage("lin_stag")
+        directive = [event for event in events if event.type == "control.directive.emitted"][-1]
+        assert directive.data["directive"] == Directive.UNSTUCK.value
+        assert directive.data["is_terminal"] is False
+        assert directive.data["extra"]["step_action"] == StepAction.STAGNATED.value
+        assert directive.data["extra"]["is_terminal"] is False
+
+        replayed = LineageProjector().project(events)
+        assert replayed is not None
+        assert replayed.status == LineageStatus.ACTIVE
+
+    @pytest.mark.asyncio
+    async def test_exhaustion_at_max_generations(self) -> None:
+        """When max_generations reached, action=EXHAUSTED."""
+        store = await create_event_store()
+        seed = make_seed(seed_id="seed_exh_1")
+
+        # Config with max_generations=3 for faster test
+        loop = EvolutionaryLoop(
+            event_store=store,
+            config=EvolutionaryLoopConfig(
+                max_generations=3,
+                min_generations=1,
+                convergence_threshold=0.95,
+                stagnation_window=3,
+            ),
+        )
+
+        # Seed 2 completed generations
+        await event_store_with_n_generations(store, "lin_exh", seed, n=2)
+
+        # Gen 3 = max_generations
+        seed_v3 = make_seed(seed_id="seed_exh_3", parent_seed_id="seed_exh_2")
+        gen_result = GenerationResult(
+            generation_number=3,
+            seed=seed_v3,
+            evaluation_summary=make_eval_summary(),
+            wonder_output=make_wonder_output(),
+            ontology_delta=OntologyDelta(similarity=1.0),
+            phase=GenerationPhase.COMPLETED,
+            success=True,
+        )
+        loop._run_generation = AsyncMock(return_value=Result.ok(gen_result))
+
+        result = await loop.evolve_step("lin_exh")
+
+        assert result.is_ok
+        step = result.value
+        assert step.action in (StepAction.EXHAUSTED, StepAction.CONVERGED)
+
+
+class TestEvolveStepErrors:
+    """Test error cases."""
+
+    @pytest.mark.asyncio
+    async def test_error_no_events_no_seed(self) -> None:
+        """No events + no initial_seed → error."""
+        store = await create_event_store()
+        loop = make_loop(store)
+
+        result = await loop.evolve_step("lin_empty")
+
+        assert result.is_err
+        assert "initial_seed" in str(result.error).lower()
+
+    @pytest.mark.asyncio
+    async def test_error_terminated_lineage(self) -> None:
+        """Calling evolve_step on a converged lineage → error."""
+        store = await create_event_store()
+        seed = make_seed()
+
+        # Create events including convergence
+        await seed_events_for_gen1(store, "lin_done", seed, make_eval_summary())
+        from ouroboros.events.lineage import lineage_converged
+
+        await store.append(lineage_converged("lin_done", 1, "Ontology stable", 0.98))
+
+        loop = make_loop(store)
+        result = await loop.evolve_step("lin_done")
+
+        assert result.is_err
+        assert "terminated" in str(result.error).lower()
+
+    @pytest.mark.asyncio
+    async def test_error_no_seed_json_in_events(self) -> None:
+        """Events without seed_json → error for Gen 2+."""
+        store = await create_event_store()
+        seed = make_seed()
+
+        # Manually create events WITHOUT seed_json (simulating old version)
+        await store.append(lineage_created("lin_old", seed.goal))
+        await store.append(
+            lineage_generation_completed(
+                "lin_old",
+                generation_number=1,
+                seed_id=seed.metadata.seed_id,
+                ontology_snapshot=seed.ontology_schema.model_dump(mode="json"),
+                # No seed_json!
+            )
+        )
+
+        loop = make_loop(store)
+        result = await loop.evolve_step("lin_old")
+
+        assert result.is_err
+        assert "seed_json" in str(result.error).lower()
+
+    @pytest.mark.asyncio
+    async def test_failed_generation_returns_failed_action(self) -> None:
+        """_run_generation error → StepResult with action=FAILED."""
+        store = await create_event_store()
+        seed = make_seed()
+
+        loop = make_loop(
+            store,
+            gen_error=OuroborosError("Reflect failed: timeout"),
+        )
+
+        result = await loop.evolve_step("lin_fail", initial_seed=seed)
+
+        assert result.is_ok  # evolve_step wraps errors in StepResult
+        step = result.value
+        assert step.action == StepAction.FAILED
+
+    @pytest.mark.asyncio
+    async def test_watchdog_timeout_without_directive_metadata_emits_no_fallback_directive(
+        self,
+    ) -> None:
+        """Watchdog timeout without persisted directive metadata must not synthesize one."""
+        store = await create_event_store()
+        seed = make_seed()
+
+        timeout = GenerationWatchdogTimeout(
+            timeout_kind="no_material_progress_timeout",
+            reason="Generation had no material progress",
+            details={
+                "timeout_kind": "no_material_progress_timeout",
+                "lineage_id": "lin_watchdog_no_metadata",
+                "generation_number": 1,
+            },
+        )
+        loop = make_loop(store, gen_error=timeout)
+
+        result = await loop.evolve_step("lin_watchdog_no_metadata", initial_seed=seed)
+
+        assert result.is_ok
+        step = result.value
+        assert step.action == StepAction.FAILED
+        assert step.generation_result.success is False
+
+        events = await store.replay_lineage("lin_watchdog_no_metadata")
+        assert [event for event in events if event.type == "control.directive.emitted"] == []
+
+
+class TestWatchdogDirectiveEmission:
+    """Watchdog timeouts must land on the control-plane directive stream."""
+
+    @pytest.mark.asyncio
+    async def test_run_watchdog_no_material_progress_emits_unstuck_directive(self) -> None:
+        store = await create_event_store()
+        seed = make_seed(seed_id="seed_run_watchdog")
+        timeout = make_watchdog_timeout(
+            "no_material_progress_timeout",
+            "lin_run_watchdog",
+        )
+        loop = EvolutionaryLoop(event_store=store)
+        loop._run_generation_with_watchdog = AsyncMock(return_value=Result.err(timeout))
+
+        result = await loop.run(seed, lineage_id="lin_run_watchdog")
+
+        assert result.is_err
+        events = await store.replay_lineage("lin_run_watchdog")
+        directives = [event for event in events if event.type == "control.directive.emitted"]
+        assert len(directives) == 1
+        directive = directives[0]
+        assert directive.data["directive"] == Directive.UNSTUCK.value
+        assert directive.data["is_terminal"] is False
+        assert directive.data["emitted_by"] == "evolver.watchdog"
+        assert directive.data["reason"] == timeout.message
+        assert directive.data["execution_id"] == "evolve:lin_run_watchdog:generation:1"
+        assert directive.data["extra"]["timeout_kind"] == "no_material_progress_timeout"
+        assert directive.data["extra"]["is_terminal"] is False
+        assert directive.data["extra"]["step_action"] == StepAction.STAGNATED.value
+        assert directive.data["extra"]["watchdog_details"]["timeout_kind"] == (
+            "no_material_progress_timeout"
+        )
+
+    @pytest.mark.asyncio
+    async def test_evolve_step_watchdog_no_material_progress_returns_stagnated(self) -> None:
+        store = await create_event_store()
+        seed = make_seed(seed_id="seed_step_no_material")
+        timeout = make_watchdog_timeout(
+            "no_material_progress_timeout",
+            "lin_step_no_material",
+        )
+        loop = EvolutionaryLoop(event_store=store)
+        loop._run_generation_with_watchdog = AsyncMock(return_value=Result.err(timeout))
+
+        result = await loop.evolve_step("lin_step_no_material", initial_seed=seed)
+
+        assert result.is_ok
+        assert result.value.action is StepAction.STAGNATED
+        events = await store.replay_lineage("lin_step_no_material")
+        directives = [event for event in events if event.type == "control.directive.emitted"]
+        assert len(directives) == 1
+        directive = directives[0]
+        assert directive.data["directive"] == Directive.UNSTUCK.value
+        assert directive.data["is_terminal"] is False
+        assert directive.data["extra"]["timeout_kind"] == "no_material_progress_timeout"
+        assert directive.data["extra"]["step_action"] == StepAction.STAGNATED.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timeout_kind", ["safety_timeout", "idle_timeout"])
+    async def test_evolve_step_watchdog_terminal_timeouts_emit_cancel_directive(
+        self,
+        timeout_kind: str,
+    ) -> None:
+        store = await create_event_store()
+        seed = make_seed(seed_id=f"seed_{timeout_kind}")
+        timeout = make_watchdog_timeout(timeout_kind, "lin_step_watchdog")
+        loop = EvolutionaryLoop(event_store=store)
+        loop._run_generation_with_watchdog = AsyncMock(return_value=Result.err(timeout))
+
+        result = await loop.evolve_step("lin_step_watchdog", initial_seed=seed)
+
+        assert result.is_ok
+        assert result.value.action is StepAction.EXHAUSTED
+        events = await store.replay_lineage("lin_step_watchdog")
+        directives = [event for event in events if event.type == "control.directive.emitted"]
+        assert len(directives) == 1
+        directive = directives[0]
+        assert directive.data["directive"] == Directive.CANCEL.value
+        assert directive.data["is_terminal"] is True
+        assert directive.data["emitted_by"] == "evolver.watchdog"
+        assert directive.data["reason"] == timeout.message
+        assert directive.data["execution_id"] == "evolve:lin_step_watchdog:generation:1"
+        assert directive.data["extra"]["timeout_kind"] == timeout_kind
+        assert directive.data["extra"]["is_terminal"] is True
+        assert directive.data["extra"]["step_action"] == StepAction.EXHAUSTED.value
+        assert directive.data["extra"]["watchdog_details"]["timeout_kind"] == timeout_kind
+
+
+class TestRunEmitsSeedJson:
+    """Test that run() now emits seed_json in events."""
+
+    @pytest.mark.asyncio
+    async def test_run_events_include_seed_json(self) -> None:
+        """run() method emits seed_json in lineage_generation_completed events."""
+        store = await create_event_store()
+        seed = make_seed()
+
+        gen_result = GenerationResult(
+            generation_number=1,
+            seed=seed,
+            evaluation_summary=make_eval_summary(score=0.99),
+            wonder_output=make_wonder_output(should_continue=False),
+            ontology_delta=OntologyDelta(similarity=1.0),
+            phase=GenerationPhase.COMPLETED,
+            success=True,
+        )
+
+        loop = EvolutionaryLoop(
+            event_store=store,
+            config=EvolutionaryLoopConfig(min_generations=1),
+        )
+        loop._run_generation = AsyncMock(return_value=Result.ok(gen_result))
+
+        result = await loop.run(seed)
+        assert result.is_ok
+
+        events = await store.replay_lineage(result.value.lineage.lineage_id)
+        completed_events = [e for e in events if e.type == "lineage.generation.completed"]
+        assert len(completed_events) >= 1
+
+        for ev in completed_events:
+            assert "seed_json" in ev.data
+            # Verify the seed_json round-trips
+            reconstructed = Seed.from_dict(json.loads(ev.data["seed_json"]))
+            assert reconstructed.goal == seed.goal
+
+
+class TestEvolveStepResume:
+    """Test resumption after failures."""
+
+    @pytest.mark.asyncio
+    async def test_resume_after_failed_generation(self) -> None:
+        """Failed Gen 2 → evolve_step resumes at Gen 2 (not Gen 3)."""
+        store = await create_event_store()
+        seed = make_seed(seed_id="seed_resume_1")
+
+        # Gen 1 completed
+        await seed_events_for_gen1(store, "lin_resume", seed, make_eval_summary())
+
+        # Gen 2 started but failed
+        from ouroboros.events.lineage import (
+            lineage_generation_failed,
+            lineage_generation_started,
+        )
+
+        await store.append(lineage_generation_started("lin_resume", 2, "wondering"))
+        await store.append(lineage_generation_failed("lin_resume", 2, "reflecting", "LLM timeout"))
+
+        # Now resume — should retry Gen 2
+        seed_v2 = make_seed(seed_id="seed_resume_2", parent_seed_id="seed_resume_1")
+        gen_result = GenerationResult(
+            generation_number=2,
+            seed=seed_v2,
+            evaluation_summary=make_eval_summary(),
+            phase=GenerationPhase.COMPLETED,
+            success=True,
+        )
+        loop = make_loop(store, gen_result=gen_result)
+
+        result = await loop.evolve_step("lin_resume")
+
+        assert result.is_ok
+        step = result.value
+        assert step.generation_result.generation_number == 2
+
+
+class TestRunGenerationFailures:
+    """Test failure event emission inside _run_generation()."""
+
+    @pytest.mark.asyncio
+    async def test_seed_generation_failure_emits_failed_event(self) -> None:
+        """Seed generation errors should emit lineage.generation.failed(seeding)."""
+        store = await create_event_store()
+        seed_v1 = make_seed(seed_id="seed_seedfail_1")
+
+        # Build lineage with one completed generation so Gen 2 triggers Wonder/Reflect path
+        lineage = OntologyLineage(
+            lineage_id="lin_seedgen_fail",
+            goal=seed_v1.goal,
+            generations=(
+                GenerationRecord(
+                    generation_number=1,
+                    seed_id=seed_v1.metadata.seed_id,
+                    ontology_snapshot=seed_v1.ontology_schema,
+                    evaluation_summary=make_eval_summary(),
+                    phase=GenerationPhase.COMPLETED,
+                    seed_json=json.dumps(seed_v1.to_dict()),
+                ),
+            ),
+        )
+
+        wonder_engine = MagicMock()
+        wonder_engine.wonder = AsyncMock(return_value=Result.ok(make_wonder_output()))
+
+        reflect_engine = MagicMock()
+        reflect_engine.reflect = AsyncMock(
+            return_value=Result.ok(
+                ReflectOutput(
+                    refined_goal=seed_v1.goal,
+                    refined_constraints=seed_v1.constraints,
+                    refined_acs=seed_v1.acceptance_criteria,
+                    ontology_mutations=(),
+                    reasoning="test",
+                )
+            )
+        )
+
+        seed_generator = MagicMock()
+        seed_generator.generate_from_reflect = MagicMock(
+            return_value=Result.err("synthetic seed generation failure")
+        )
+
+        loop = EvolutionaryLoop(
+            event_store=store,
+            wonder_engine=wonder_engine,
+            reflect_engine=reflect_engine,
+            seed_generator=seed_generator,
+        )
+
+        result = await loop._run_generation(
+            lineage=lineage,
+            generation_number=2,
+            current_seed=seed_v1,
+        )
+        assert result.is_err
+
+        events = await store.replay_lineage("lin_seedgen_fail")
+        failed = [e for e in events if e.type == "lineage.generation.failed"]
+        assert len(failed) == 1
+        assert failed[0].data["phase"] == GenerationPhase.SEEDING.value
+        assert "synthetic seed generation failure" in failed[0].data["error"]
+
+    @pytest.mark.asyncio
+    async def test_failed_directive_phase_recovers_cancelled_runtime_phase(self) -> None:
+        """Timeout cancellation reports the last real runtime phase, not cancelled."""
+        store = await create_event_store()
+        seed = make_seed(seed_id="seed_timeout_phase_1")
+        await store.append(lineage_created("lin_timeout_phase", seed.goal))
+        await store.append(
+            lineage_generation_started(
+                "lin_timeout_phase",
+                2,
+                GenerationPhase.WONDERING.value,
+                seed.metadata.seed_id,
+            )
+        )
+        await store.append(
+            lineage_generation_phase_changed(
+                "lin_timeout_phase",
+                2,
+                GenerationPhase.REFLECTING.value,
+            )
+        )
+        await store.append(
+            lineage_generation_failed(
+                "lin_timeout_phase",
+                2,
+                GenerationPhase.CANCELLED.value,
+                "Generation cancelled by timeout",
+            )
+        )
+        loop = make_loop(store)
+
+        phase = await loop._phase_for_failed_step_directive(
+            lineage_id="lin_timeout_phase",
+            generation_number=2,
+        )
+
+        assert phase == GenerationPhase.REFLECTING.value
+
+    async def test_evolve_step_failed_directive_uses_generation_failure_phase(self) -> None:
+        """StepAction.FAILED directive should preserve the failed runtime phase."""
+        store = await create_event_store()
+        seed_v1 = make_seed(seed_id="seed_step_seedfail_1")
+        await seed_events_for_gen1(store, "lin_step_seedgen_fail", seed_v1, make_eval_summary())
+
+        wonder_engine = MagicMock()
+        wonder_engine.wonder = AsyncMock(return_value=Result.ok(make_wonder_output()))
+
+        reflect_engine = MagicMock()
+        reflect_engine.reflect = AsyncMock(
+            return_value=Result.ok(
+                ReflectOutput(
+                    refined_goal=seed_v1.goal,
+                    refined_constraints=seed_v1.constraints,
+                    refined_acs=seed_v1.acceptance_criteria,
+                    ontology_mutations=(),
+                    reasoning="test",
+                )
+            )
+        )
+
+        seed_generator = MagicMock()
+        seed_generator.generate_from_reflect = MagicMock(
+            return_value=Result.err("synthetic seed generation failure")
+        )
+
+        loop = EvolutionaryLoop(
+            event_store=store,
+            wonder_engine=wonder_engine,
+            reflect_engine=reflect_engine,
+            seed_generator=seed_generator,
+        )
+
+        result = await loop.evolve_step("lin_step_seedgen_fail")
+        assert result.is_ok
+        assert result.value.action is StepAction.FAILED
+
+        events = await store.replay_lineage("lin_step_seedgen_fail")
+        directive = [e for e in events if e.type == "control.directive.emitted"][-1]
+        assert directive.data["phase"] == GenerationPhase.SEEDING.value
+        assert directive.data["directive"] == "retry"
+
+
+class TestLineageStatusHandler:
+    """Test LineageStatusHandler MCP tool."""
+
+    @pytest.mark.asyncio
+    async def test_returns_status(self) -> None:
+        """Handler returns formatted lineage status."""
+        from ouroboros.mcp.tools.definitions import LineageStatusHandler
+
+        store = await create_event_store()
+        seed = make_seed()
+        await seed_events_for_gen1(store, "lin_status", seed, make_eval_summary())
+
+        handler = LineageStatusHandler(event_store=store)
+        handler._event_store = store
+        handler._initialized = True
+
+        result = await handler.handle({"lineage_id": "lin_status"})
+
+        assert result.is_ok
+        text = result.value.text_content
+        assert "lin_status" in text
+        assert "Build a task manager" in text
+        assert result.value.meta["generations"] == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_lineage_returns_error(self) -> None:
+        """Handler returns error for non-existent lineage."""
+        from ouroboros.mcp.tools.definitions import LineageStatusHandler
+
+        store = await create_event_store()
+        handler = LineageStatusHandler(event_store=store)
+        handler._event_store = store
+        handler._initialized = True
+
+        result = await handler.handle({"lineage_id": "nonexistent"})
+
+        assert result.is_err
+
+
+class TestEvolveStepHandler:
+    """Test EvolveStepHandler MCP tool."""
+
+    @pytest.mark.asyncio
+    async def test_handler_gen1(self) -> None:
+        """Handler runs Gen 1 with seed_content."""
+        from ouroboros.mcp.tools.definitions import EvolveStepHandler
+
+        store = await create_event_store()
+        seed = make_seed()
+
+        gen_result = GenerationResult(
+            generation_number=1,
+            seed=seed,
+            evaluation_summary=make_eval_summary(),
+            phase=GenerationPhase.COMPLETED,
+            success=True,
+        )
+        loop = make_loop(store, gen_result=gen_result)
+
+        handler = EvolveStepHandler(evolutionary_loop=loop)
+
+        import yaml
+
+        with patch(
+            "ouroboros.mcp.tools.evolution_handlers.maybe_restore_task_workspace",
+            return_value=None,
+        ):
+            result = await handler.handle(
+                {
+                    "lineage_id": "lin_handler_test",
+                    "seed_content": yaml.dump(seed.to_dict()),
+                    "skip_qa": True,
+                }
+            )
+
+        assert result.is_ok
+        assert "Generation 1" in result.value.text_content
+        assert result.value.meta["action"] == "continue"
+
+    @pytest.mark.asyncio
+    async def test_handler_resets_project_dir_after_call(self) -> None:
+        """Handler should not leak project_dir between evolve_step calls."""
+        from ouroboros.mcp.tools.definitions import EvolveStepHandler
+
+        store = await create_event_store()
+        seed = make_seed()
+
+        gen_result = GenerationResult(
+            generation_number=1,
+            seed=seed,
+            evaluation_summary=make_eval_summary(),
+            phase=GenerationPhase.COMPLETED,
+            success=True,
+        )
+        loop = make_loop(store, gen_result=gen_result)
+        handler = EvolveStepHandler(evolutionary_loop=loop)
+
+        import yaml
+
+        result = await handler.handle(
+            {
+                "lineage_id": "lin_handler_project_dir",
+                "seed_content": yaml.dump(seed.to_dict()),
+                "project_dir": "/tmp/test-project",
+                "skip_qa": True,
+            }
+        )
+
+        assert result.is_ok
+        assert loop.get_project_dir() is None
+
+    @pytest.mark.asyncio
+    async def test_handler_without_project_dir_succeeds_outside_git_repo(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Handler should still run when server cwd is not a git repo."""
+        from ouroboros.mcp.tools.definitions import EvolveStepHandler
+
+        monkeypatch.chdir(tmp_path)
+
+        store = await create_event_store()
+        seed = make_seed()
+
+        gen_result = GenerationResult(
+            generation_number=1,
+            seed=seed,
+            evaluation_summary=make_eval_summary(),
+            phase=GenerationPhase.COMPLETED,
+            success=True,
+        )
+        loop = make_loop(store, gen_result=gen_result)
+        handler = EvolveStepHandler(evolutionary_loop=loop)
+
+        import yaml
+
+        result = await handler.handle(
+            {
+                "lineage_id": "lin_handler_non_git_cwd",
+                "seed_content": yaml.dump(seed.to_dict()),
+                "skip_qa": True,
+            }
+        )
+
+        assert result.is_ok
+        assert loop.get_project_dir() is None
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_task_workspace_error_for_invalid_lineage_id(self) -> None:
+        """Invalid worktree-backed lineage IDs should fail as structured task workspace errors."""
+        from ouroboros.mcp.tools.definitions import EvolveStepHandler
+
+        store = await create_event_store()
+        seed = make_seed()
+        gen_result = GenerationResult(
+            generation_number=1,
+            seed=seed,
+            evaluation_summary=make_eval_summary(),
+            phase=GenerationPhase.COMPLETED,
+            success=True,
+        )
+        loop = make_loop(store, gen_result=gen_result)
+        handler = EvolveStepHandler(evolutionary_loop=loop)
+
+        with (
+            patch("ouroboros.mcp.tools.evolution_handlers.is_git_repo", return_value=True),
+            patch(
+                "ouroboros.mcp.tools.evolution_handlers.maybe_restore_task_workspace",
+                side_effect=WorktreeError("Invalid durable task identifier for git worktree"),
+            ),
+        ):
+            result = await handler.handle(
+                {
+                    "lineage_id": "bad id",
+                    "project_dir": "/tmp/test-project",
+                    "skip_qa": True,
+                }
+            )
+
+        assert result.is_err
+        assert "Task workspace error" in str(result.error)
+
+    @pytest.mark.asyncio
+    async def test_handler_no_loop_returns_error(self) -> None:
+        """Handler without evolutionary_loop returns error."""
+        from ouroboros.mcp.tools.definitions import EvolveStepHandler
+
+        handler = EvolveStepHandler(evolutionary_loop=None)
+        result = await handler.handle({"lineage_id": "test"})
+
+        assert result.is_err
+
+
+# -- Helper for multi-generation seeding --
+
+
+async def event_store_with_n_generations(
+    store: EventStore,
+    lineage_id: str,
+    initial_seed: Seed,
+    n: int,
+) -> None:
+    """Populate EventStore with n completed generations."""
+    await store.append(lineage_created(lineage_id, initial_seed.goal))
+
+    current_seed = initial_seed
+    for i in range(1, n + 1):
+        seed_id = f"{initial_seed.metadata.seed_id.rsplit('_', 1)[0]}_{i}"
+        parent_id = current_seed.metadata.seed_id if i > 1 else None
+        gen_seed = make_seed(
+            seed_id=seed_id,
+            parent_seed_id=parent_id,
+            goal=initial_seed.goal,
+        )
+        await store.append(
+            lineage_generation_completed(
+                lineage_id,
+                generation_number=i,
+                seed_id=gen_seed.metadata.seed_id,
+                ontology_snapshot=gen_seed.ontology_schema.model_dump(mode="json"),
+                evaluation_summary=make_eval_summary().model_dump(mode="json"),
+                wonder_questions=[f"Question from gen {i}"],
+                seed_json=json.dumps(gen_seed.to_dict()),
+            )
+        )
+        current_seed = gen_seed

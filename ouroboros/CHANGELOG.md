@@ -1,0 +1,326 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Fixed
+- **run/mcp**: Make fat-harness acceptance opt-in via `seed.orchestrator.execution_mode: fat_harness` for fresh CLI/MCP seed execution. Missing/blank execution mode now uses the default runner again until seed authoring and QA guidance consistently emit profile-compatible typed evidence for every AC. This mitigates layered scaffold AC failures reported in #1202.
+
+### Added
+- **providers**: GitHub Copilot CLI adapter (`CopilotCliLLMAdapter`) — first-class peer of Codex/Gemini/OpenCode adapters. Switch with `OUROBOROS_LLM_BACKEND=copilot`. Uses local `copilot -p` non-interactive mode with `GH_TOKEN`/`GITHUB_TOKEN` auth, hard tool envelope via `--available-tools`+`--allow-tool`+`--add-dir`, sandbox-class permission mapping, JSONL stream parsing, recursion guard via shared `_OUROBOROS_DEPTH` counter (max depth 5), and auth-error short-circuit on `401`/missing-token detections. Optional install: `pip install ouroboros-ai[copilot]` (the Copilot CLI itself is installed externally).
+- **opencode**: Subagent bridge plugin (`src/ouroboros/opencode/plugin/ouroboros-bridge.ts`) — routes MCP `ouroboros_*` tool calls with a `_subagent` parameter into OpenCode's native Task subagent panes via `session.promptAsync`. Fire-and-forget dispatch returns from the hook in ~10ms, eliminating the blocking 200s+ latency of the previous `session.prompt` approach. Installed automatically by `ouroboros setup`. See [OpenCode Subagent Bridge](docs/guides/opencode-subagent-bridge.md).
+- **lateral_think**: Parallel multi-persona dispatch — `ouroboros_lateral_think` now accepts `persona="all"` or `personas=["hacker","architect",...]` to fan out to multiple lateral-thinking personas in a single call. Each persona runs in its own Task pane with an independent LLM context, eliminating anchoring bias across alternatives. Uses new `_subagents` (plural) JSON contract, implemented server-side via `build_lateral_multi_subagent()` and plugin-side via MAX_FANOUT=10 parallel `promptAsync` with per-payload dedupe and error isolation.
+- **opencode/bridge**: Plugin v23 recognizes `_subagents` array for parallel fan-out. Per-payload validation, truncation, and dedupe. One failed dispatch does not abort the rest. New `ouroboros_subagents` and `ouroboros_dispatch_errors` metadata fields. Backwards compatible with v22 single-payload `_subagent` contract.
+
+### Fixed
+- **skills**: Renamed the packaged `resume` skill to `resume-session` so Claude Code's built-in `/resume` session picker is no longer shadowed. Use `ooo resume-session` or `/ouroboros:resume-session` for the Ouroboros in-flight session listing.
+- **mcp/security**: `FREETEXT_FIELDS` allowlist for user-input fields (goals, prompts, descriptions) — shell metacharacters (`;`, `|`, `&`, backticks, `$()`) are no longer rejected in fields where they are legitimate prose. Structural fields remain strictly validated.
+- **opencode/bridge**: Robustness hardening (v22) — no uncaught errors under any input. Adds reject-path logging, frozen-content guards, empty-sessionID guard, client init-order guard, 5-second FNV-1a prompt dedupe, 100 KB prompt byte cap with truncation marker, user-visible `surfaceErr()` for dispatch failures (no more silent "dispatched but never ran"), and an absolute outer try/catch so the plugin cannot throw into the opencode runLoop.
+
+## [0.41.0] - 2026-06-07
+
+> Run it anywhere, and trust what it ships. Pi joins as a first-class runtime,
+> the Socratic interview convenes a multi-persona panel at every ambiguity
+> milestone, and the verifier's "done" verdict becomes typed, audited, and
+> impossible to game.
+
+### Added
+- **providers**: Pi LLM adapter (`PiLLMAdapter`) for `--llm-backend pi` — `pi` /
+  `pi_cli` registered as LLM- and interview-driver-capable in the backend
+  registry and provider factory; Pi-aware default-model normalization so the
+  default uses Pi's own backend default instead of forwarding an Anthropic model
+  name (#1326)
+- **runtime**: `ouroboros setup --runtime pi` wires the managed Pi bridge setup
+  surface (5c674c11)
+- **interview**: milestone lateral-review **dispatch** (promoted from advisory) —
+  at `initial→progress`, `progress→refined`, `refined→ready` transitions the main
+  session runs `ouroboros_lateral_think` with researcher/contrarian/simplifier
+  (+architect when system shape changes) before answering or asking the returned
+  question, folding findings into 2–3 concrete options or a recommended draft.
+  Adds the `run_lateral_review` interview capability and per-runtime
+  capability/instruction artifacts (9d229c4c)
+- **harness**: promote TraceGuard verdict admission into `VerifierVerdict` —
+  typed status, evidence refs, and `retry_admission`; ACCEPT / RETRY / REDISPATCH /
+  ESCALATE_MODEL / ESCALATE_HUMAN / BLOCK persisted on atomic typed-evidence
+  events (RFC #814) (#1330)
+
+### Changed
+- **config**: centralize every default Claude model pin into one source of truth
+  (`_model_defaults.py`) and pin exact snapshots rather than the `"default"`
+  sentinel for reproducible grading — Opus reasoning tier → 4.8, Sonnet judgment
+  tier (`qa_model`) pinned at 4.6, retiring the dated `claude-sonnet-4-20250514`
+  (#1324, #1323)
+- **harness/h7**: prefer `VerifierVerdict.retry_admission` over the
+  failure-class-derived policy when an explicit admission is present; re-run the
+  same leaf only on `RETRY` (#1331)
+- **auto**: gate runs on backend-confirmed low ambiguity (≤ 0.20) plus a pre-run
+  Seed QA pass, feeding QA findings into bounded Seed-repair attempts before
+  blocking (#1302)
+- **auto**: normalize worktree-policy aliases (e.g. `create_isolated_worktree →
+  always`) and fail fast when `complete_product=true` is paired with a too-short
+  timeout (#1305)
+- **deps**: prune unused optional packages (#1301)
+
+### Fixed
+- **pi**: align the runtime with documented JSON mode (#1321)
+- **pi**: report malformed runtime events as a typed `ProviderError` (#1325)
+- **orchestrator**: classify masked test evidence (`… | tail`) as
+  `EVIDENCE_FORM_MISMATCH` — retryable with actionable feedback (e.g.
+  `set -o pipefail`) — instead of `FABRICATION_SUSPECTED`; the #1208 guard holds
+  (#1292)
+- **installer**: run `setup` with the freshly installed `ouroboros` binary, not a
+  stale one on `PATH`; preserve existing `PATH` precedence on pipx/pip paths
+  (#1345, #1343)
+- **opencode**: cover Windows cleanup review blockers (#1320)
+- **goose**: keep LLM completion calls profile-free (#1303)
+- **run**: guard the home directory in `_detect_project_root_from_seed_path`
+  (#1313)
+- **deps**: pin `typer` before the vendored `click` to stabilize resolution
+  (#1300)
+
+### Testing
+- **orchestrator**: opt-in native Pi CLI smoke test (#1329)
+
+### Docs
+- Pi provider surfaces (#1327) and Pi runtime guide; fix shipped-backend wording
+  (#1332); AgentOS issue-sequencing graph snapshot (#1293); Verdict Envelope v1
+  RFC and verifier-evidence-policy; runtime-capability-matrix and
+  contributing/key-patterns updates
+
+## [0.14.1] - 2025-02-27
+
+### Fixed
+- **interview**: Fix empty response bypass in ClaudeCodeAdapter — empty content now always triggers error regardless of session_id
+- **interview**: Fix sub-agent turn exhaustion — increase max_turns from 1 to 3 so the agent can use tools and still generate the question
+
+### Maintenance
+- **style**: Apply ruff format to 4 files
+- **ci**: Resolve ruff and mypy CI failures
+
+## [0.13.4] - 2025-02-24
+
+### Fixed
+- **mcp**: Initialize EventStore in ExecuteSeedHandler before passing to OrchestratorRunner
+
+## [0.13.3] - 2025-02-24
+
+### Fixed
+- **mcp**: Remove double-registration in CLI that overwrote dependency-injected handlers with empty ones
+- **mcp**: Return proper MCP error responses (isError:true) instead of error text in success
+- **mcp**: Catch `pydantic.ValidationError` in ExecuteSeed, MeasureDrift, Evaluate handlers
+- **mcp**: Initialize EventStore before EvolutionaryLoop.evolve_step accesses it
+- **mcp**: Forward host/port CLI args to server for SSE transport
+- **mcp**: Remove dead code (discarded EvaluationPipeline/LateralThinker instances)
+- **mcp**: Remove invalid `llm_adapter` kwarg from ClaudeAgentAdapter init
+- **orchestrator**: Handle DependencyAnalyzer error with all-parallel fallback instead of crash
+- **seed**: Add Pydantic aliases (`type` for field_type, `criteria` for evaluation_criteria)
+- **eval**: Change EvaluationPipeline/SeedGenerator type annotations from LiteLLMAdapter to LLMAdapter Protocol
+- **security**: Validate nested string values in InputValidator, not just top-level
+- **security**: Use MappingProxyType for frozen dataclass AuthContext.metadata
+- **protocol**: Add credentials param to MCPServer protocol to match implementation
+
+### Changed
+- **build**: Use dynamic version from `__init__.py` via hatchling (single source of truth)
+
+## [0.13.2] - 2025-02-24
+
+### Fixed
+- **adapter**: Handle unknown message types (`rate_limit_event`) from Claude Agent SDK with retry logic
+- **interview**: Ensure first response is a direct question, not introduction
+- **mcp**: Correct uvx command syntax to use `--python 3.14 --from ouroboros-ai` for proper version resolution
+
+## [Unreleased]
+
+### Added
+
+#### Plugin System - Agent Orchestration Framework (Phase 1)
+
+**Agent System (`ouroboros.plugin.agents`)**
+- `AgentRegistry` - Dynamic agent discovery with custom `.md` file support from `.claude-plugin/agents/`
+- `AgentPool` - Reusable agent pool with load balancing, auto-scaling, and health monitoring
+- `AgentRole` enum - Type-safe role categorization (ANALYSIS, PLANNING, EXECUTION, REVIEW, DOMAIN, PRODUCT, COORDINATION)
+- `AgentSpec` - Frozen dataclass for agent specifications with tools, capabilities, and model preferences
+- 4 builtin agents: `executor`, `planner`, `verifier`, `analyst`
+
+**Skill System (`ouroboros.plugin.skills`)**
+- `SkillRegistry` - Hot-reloadable skill discovery from `.claude-plugin/skills/`
+- `MagicKeywordDetector` - "ooo:" prefix and trigger keyword routing
+- `SkillExecutor` - Context-aware skill execution with history tracking
+- `SkillDocumentation` - Auto-generated documentation from SKILL.md files
+- 9 new execution mode skills:
+  - `autopilot` - Autonomous execution from idea to working code
+  - `ultrawork` - Maximum parallelism with parallel agent orchestration
+  - `ralph` - Self-referential loop with verifier verification (includes ultrawork)
+  - `ultrapilot` - Parallel autopilot with file ownership partitioning
+  - `ecomode` - Token-efficient execution using haiku and sonnet
+  - `swarm` - N coordinated agents using native runtime teams
+  - `pipeline` - Sequential agent chaining with data passing
+  - `tutorial` - Interactive guided tour for new users
+  - `swarm` - Team coordination mode
+
+**Orchestration (`ouroboros.plugin.orchestration`)**
+- `ModelRouter` - PAL (Progressive Auto-escalation) routing with tier selection
+- `Scheduler` - Parallel task execution with dependency resolution via `TaskGraph`
+- `RoutingContext` - Complexity-aware routing with learning from history
+- `ScheduledTask` - Task wrapper with priority, dependencies, and timeout support
+
+**State Management**
+- Removed: `StateStore`, `StateManager`, `RecoveryManager`, `StateCompression` (dead code — all runtime state managed by EventStore/SQLite)
+
+**TUI HUD Components (`ouroboros.tui.components`)**
+- `AgentsPanel` - Real-time agent pool status visualization
+- `TokenTracker` - Per-agent token usage with cost estimation
+- `ProgressBar` - Multi-phase progress with animated spinners
+- `EventLog` - Scrolling event history with color-coded severity
+- `HUDDashboard` - Unified HUD screen integrating all components
+
+**Documentation**
+- `docs/compare-alternatives.md` - Comparison with other AI agents and frameworks
+- `docs/onboarding-metrics.md` - User onboarding metrics and optimization strategies
+- `docs/marketing/` - Marketing assets (social media templates, star campaign, why ouroboros)
+- `docs/screenshots/` - Screenshot capture guides and production scripts
+- `docs/videos/` - Video production guides and demo scripts
+- Updated `CONTRIBUTING.md` - Full development setup and contribution guide
+- Updated `docs/architecture.md` - Plugin system architecture documentation
+- Updated `docs/getting-started.md` - Enhanced onboarding experience
+
+**Developer Experience**
+- GitHub workflows: `.github/workflows/lint.yml`, `test.yml`, `release.yml`
+- `playground/` directory with example models and configurations
+- 161 new passing tests (149 unit + 12 integration)
+
+**Skill Files Updated**
+- Updated `help`, `setup`, `welcome` skills with progressive disclosure
+- Added 8 new skill SKILL.md files (autopilot, ultrawork, ralph, ultrapilot, ecomode, swarm, pipeline, tutorial)
+
+### Changed
+- Updated CLI onboarding flow to reference new plugin system
+- Enhanced skill discovery with automatic trigger keyword indexing
+- Improved state persistence across /clear and session restarts
+
+### Tests
+- 161 new tests for plugin system (149 unit + 12 integration)
+- All existing TUI and tree tests continue to pass (190 tests)
+- Total test count: 1731 passing tests
+
+## [0.3.0] - 2026-01-28
+
+### Added
+
+#### Documentation
+- **CLI Reference** (`docs/cli-reference.md`) - Complete command reference with examples
+- **Prerequisites section** in README with Python 3.14+ requirement
+- **Contributing section** with links to Issues and Discussions
+- **OSS badges** - PyPI version, Python version, License
+
+#### Interview System
+- **Tiered confirmation system** for interview rounds:
+  - Rounds 1-3: Auto-continue (minimum context gathering)
+  - Rounds 4-15: Ask "Continue?" after each round
+  - Rounds 16+: Ask "Continue?" with diminishing returns warning
+- **No hard round limit** - User controls when to stop
+- New constants: `MIN_ROUNDS_BEFORE_EARLY_EXIT`, `SOFT_LIMIT_WARNING_THRESHOLD`
+
+### Changed
+
+#### Interview Engine
+- Removed `MAX_INTERVIEW_ROUNDS` hard limit (was 10)
+- `is_complete` now only checks status (user-controlled completion)
+- `record_response()` no longer auto-completes at max rounds
+- System prompt simplified to show "Round N" instead of "Round N of 10"
+
+#### CLI Init Command
+- Extracted `_run_interview_loop()` helper to eliminate code duplication (~60 lines)
+- State saved immediately after status mutation for consistency
+- Updated welcome message to reflect no round limit
+
+### Removed
+- Korean-language requirement documents (`requirement/` folder)
+- Hard round limit enforcement in interview engine
+
+### Fixed
+- Code duplication in init.py interview continuation flow
+
+## [0.2.0] - 2026-01-27
+
+### Added
+
+#### Security Module (`ouroboros.core.security`)
+- New security utilities module with comprehensive protection features
+- **API Key Management**
+  - `mask_api_key()` - Safely mask API keys for logging (shows only last 4 chars)
+  - `validate_api_key_format()` - Basic format validation for API keys
+- **Sensitive Data Detection**
+  - `is_sensitive_field()` - Detect sensitive field names (api_key, password, token, etc.)
+  - `is_sensitive_value()` - Detect values that look like secrets
+  - `mask_sensitive_value()` - Mask potentially sensitive values
+  - `sanitize_for_logging()` - Create sanitized copies of dicts for safe logging
+- **Input Validation**
+  - `InputValidator` class with size limits for DoS prevention:
+    - `MAX_INITIAL_CONTEXT_LENGTH` = 50KB
+    - `MAX_USER_RESPONSE_LENGTH` = 10KB
+    - `MAX_SEED_FILE_SIZE` = 1MB
+    - `MAX_LLM_RESPONSE_LENGTH` = 100KB
+
+#### Logging Security
+- Automatic sensitive data masking in structlog processor chain
+- API keys, passwords, tokens are now automatically redacted in all log outputs
+- Nested dictionaries are recursively sanitized
+- Pattern-based detection for values starting with `sk-`, `pk-`, `Bearer`, etc.
+
+### Changed
+
+#### Interview Engine
+- Input validation now uses `InputValidator` for consistent size limits
+- `start_interview()` validates initial context length
+- `record_response()` validates user response length
+
+#### LiteLLM Adapter
+- LLM responses are now validated and truncated if exceeding size limits
+- Warning logged when response truncation occurs
+
+#### CLI Run Command
+- Seed file size is now validated before loading
+- Protection against oversized seed files
+
+### Security
+
+- **API Key Management**: Keys are masked in logs, showing only provider prefix and last 4 characters
+- **Input Validation**: All external inputs have size limits to prevent DoS attacks
+- **Log Sanitization**: Sensitive data is automatically masked in all log outputs
+- **Credentials Protection**: `credentials.yaml` continues to use chmod 600 permissions
+
+### Tests
+
+- Added comprehensive test suite for security module (39 tests)
+- Added sensitive data masking tests for logging module (5 tests)
+- All 1341 tests passing
+
+## [0.1.1] - 2026-01-15
+
+### Added
+- Initial release with core Ouroboros workflow system
+- Big Bang (Phase 0) - Interview and Seed generation
+- PAL Router (Phase 1) - Progressive Adaptive LLM selection
+- Double Diamond (Phase 2) - Execution engine
+- Resilience (Phase 3) - Stagnation detection and lateral thinking
+- Evaluation (Phase 4) - Mechanical, semantic, and consensus evaluation
+- Secondary Loop (Phase 5) - TODO registry and batch scheduler
+- Orchestrator (Epic 8) - Runtime abstraction and orchestration
+- CLI interface with Typer
+- Event sourcing with SQLite persistence
+- Structured logging with structlog
+
+### Fixed
+- Various bug fixes and stability improvements
+
+## [0.1.0] - 2026-01-01
+
+### Added
+- Initial project structure
+- Core types and error hierarchy
+- Basic configuration system

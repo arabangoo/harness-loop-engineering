@@ -1,0 +1,181 @@
+[project]
+name = "ouroboros-ai"
+dynamic = ["version"]
+description = "Specification-first workflow engine for AI coding agents. Works with Claude Code and Codex CLI."
+readme = "README.md"
+authors = [
+    { name = "Q00", email = "jqyu.lee@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "aiosqlite>=0.20.0,<1.0.0",
+    "anyio>=4.0.0,<5.0.0",
+    "click>=8.1.0,<9.0.0",
+    "jsonschema>=4.21.0,<5.0.0",
+    "pydantic>=2.0.0,<3.0.0",
+    "prompt-toolkit>=3.0.0,<4.0.0",
+    "pyyaml>=6.0.0,<7.0.0",
+    "rich>=13.0.0,<16.0.0",
+    "sqlalchemy[asyncio]>=2.0.0,<3.0.0",
+    "structlog>=24.0.0,<26.0.0",
+    "typer>=0.12.0,<0.26.0",
+]
+
+[project.optional-dependencies]
+# Exact-pinned (not ranges) on purpose: a future compromised "latest" must not
+# be auto-pulled on a fresh PyPI install (pipx / uv tool / pip resolve from
+# this metadata, NOT from uv.lock). Motivated by the 2026-03 litellm
+# 1.82.7/1.82.8 supply-chain incident. Updates land via reviewed Dependabot
+# PRs; uv.lock additionally hash-pins the full transitive graph for repo/CI.
+claude = ["claude-agent-sdk==0.1.50", "anthropic==0.105.2"]
+copilot = []
+litellm = ["litellm==1.86.2"]
+dashboard = []
+mcp = ["mcp==1.26.0"]
+tui = ["textual==8.1.1"]
+all = ["ouroboros-ai[claude,copilot,litellm,mcp,tui,dashboard]"]
+
+[project.scripts]
+ouroboros = "ouroboros.cli.main:app"
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+version_scheme = "guess-next-dev"
+local_scheme = "no-local-version"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/ouroboros/_version.py"
+
+[tool.hatch.build]
+exclude = [
+    "/.smoke-home",
+    "**/node_modules",
+    "**/target",
+    "**/__pycache__",
+    "/.mypy_cache",
+    "/.pytest_cache",
+    "/.ruff_cache",
+    "/.venv",
+    "/coverage.xml",
+    "/.coverage",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ouroboros"]
+# Scoped to wheel only: prevent the `packages=` sweep from shipping these
+# assets, so the force-include below is the single source of truth and we
+# avoid duplicate ZIP local headers (PyPI rejects those). The sdist keeps
+# the files at their natural source path so rebuilds from sdist reproduce
+# the same wheel via this same config.
+exclude = [
+    "src/ouroboros/opencode/plugin/**",
+    "src/ouroboros/plugin/schemas/**",
+    "src/ouroboros/profiles/**",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"skills" = "ouroboros/skills"
+# Explicit inclusion so `importlib.resources.files("ouroboros.opencode.plugin")`
+# reliably finds ouroboros-bridge.ts / package.json / tsconfig.json in the
+# installed wheel, independent of hatchling's implicit asset handling.
+"src/ouroboros/opencode/plugin" = "ouroboros/opencode/plugin"
+# Same pattern for the vendored UserLevel plugin schemas — `_load_schema`
+# in `ouroboros.plugin.manifest` resolves them via `importlib.resources`,
+# so they must reach the installed wheel as package data, not just the
+# source tree.
+"src/ouroboros/plugin/schemas" = "ouroboros/plugin/schemas"
+# Execution profile YAMLs (RFC v2 #830). The loader resolves them via
+# Path(__file__).parent.parent / "profiles", so they must ship with the wheel.
+"src/ouroboros/profiles" = "ouroboros/profiles"
+
+[dependency-groups]
+dev = [
+    "ouroboros-ai[claude,litellm,mcp,tui]",
+    "mypy>=1.19.1",
+    "pre-commit>=4.5.1",
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.14.11",
+    "types-pyyaml>=6.0.12.20250915",
+]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+disable_error_code = [
+    "union-attr",
+    "arg-type",
+    "return-value",
+    "assignment",
+    "attr-defined",
+    "misc",
+    "call-arg",
+    "override",
+    "list-item",
+    "dict-item",
+    "operator",
+    "str-bytes-safe",
+    "no-any-return",
+    "import-untyped",
+]
+
+[tool.pytest.ini_options]
+# asyncio_mode = "auto" per project-context.md
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "integration: integration tests that exercise cross-component behavior",
+    "slow: integration tests that build artifacts or call subprocesses",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = ["src/ouroboros/_version.py"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # Pyflakes
+    "I",     # isort
+    "B",     # flake8-bugbear
+    "C4",    # flake8-comprehensions
+    "UP",    # pyupgrade
+    "ARG",   # flake8-unused-arguments
+    "SIM",   # flake8-simplify
+]
+ignore = [
+    "E501",    # Line too long (handled by formatter)
+    "ARG002",  # Unused method argument (common in interfaces/overrides)
+    "B017",    # assert-raises-exception
+    "B023",    # function-uses-loop-variable
+    "B904",    # raise-without-from-inside-except
+    "SIM102",  # collapsible-if
+    "SIM105",  # suppressible-exception
+    "SIM108",  # if-else-block-instead-of-if-exp
+    "SIM117",  # multiple-with-statements
+]
+
+[tool.ruff.lint.isort]
+force-single-line = false
+force-sort-within-sections = true
+known-first-party = ["ouroboros"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ARG001", "ARG002", "E402"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
